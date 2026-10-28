@@ -88,6 +88,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
 
+    // Keep the resource-allocation graph of this process consistent: the thread
+    // (and its thread id, which may be recycled) must not leave stale edges in
+    // the wait-for graph behind.
+    process.inner_exclusive_access().deadlock.forget_thread(tid);
+
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {
         add_stopping_task(task);

@@ -1,10 +1,11 @@
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str},
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -148,37 +149,72 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 
 /// get_time syscall
 ///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// Fills the [`TimeVal`] the user gives us with the wall-clock time since boot.
+/// The destination is a user virtual address, and `TimeVal` is 16 bytes wide, so
+/// it may well straddle a page boundary: the bytes are therefore written through
+/// [`translated_byte_buffer`], which splits the copy at page boundaries.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let value = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let len = core::mem::size_of::<TimeVal>();
+    let src = unsafe { core::slice::from_raw_parts(&value as *const TimeVal as *const u8, len) };
+    let token = current_user_token();
+    let mut copied = 0;
+    for buf in translated_byte_buffer(token, ts as *const u8, len) {
+        for byte in buf.iter_mut() {
+            *byte = src[copied];
+            copied += 1;
+        }
+    }
+    0
 }
 
 /// mmap syscall
 ///
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+/// Map `[start, start + len)` at a fixed user virtual address as anonymous
+/// memory with the permissions in `port`, returning 0 on success and -1 when the
+/// request is malformed or overlaps something that is already mapped.
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_mmap start={:#x} len={:#x} port={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        start,
+        len,
+        port
     );
-    -1
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    if process_inner.memory_set.mmap(start, len, port) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// munmap syscall
 ///
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+/// Unmap the area that matches `[start, start + len)` exactly.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_munmap start={:#x} len={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        start,
+        len
     );
-    -1
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    if process_inner.memory_set.munmap(start, len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -191,22 +227,36 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 // }
 
 /// spawn syscall
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+///
+/// Create a new process running the program `path` and make it runnable straight
+/// away. Unlike `fork`, the address space is not copied - it is built from the
+/// ELF image - and unlike `fork` + `exec`, the caller never runs the child's
+/// program itself. Returns the new pid, or -1 when the program does not exist.
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let process = current_process();
+        let child = process.spawn(all_data.as_slice());
+        child.getpid() as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
 ///
-/// YOUR JOB: Set task priority
+/// The scheduler of this chapter is a plain FIFO ready queue without priorities,
+/// so no priority can be honoured here; the interface is kept for the user
+/// library of the earlier chapters and reports the failure with -1.
 pub fn sys_set_priority(_prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority: unsupported by the FIFO scheduler",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     -1

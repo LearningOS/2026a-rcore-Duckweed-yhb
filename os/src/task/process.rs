@@ -7,7 +7,7 @@ use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
-use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
+use crate::sync::{Condvar, DeadlockGraph, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -49,6 +49,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// resource-allocation graph used by the deadlock detector
+    pub deadlock: DeadlockGraph,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +121,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock: DeadlockGraph::new(),
                 })
             },
         });
@@ -245,6 +248,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock: DeadlockGraph::new(),
                 })
             },
         });
@@ -281,5 +285,22 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Create a child process from an ELF image and make it runnable.
+    ///
+    /// This is what `spawn` is built on: the child gets a fresh address space
+    /// built from `elf_data` (nothing of the parent is copied) and a fresh file
+    /// descriptor table, so it starts exactly like a program run by the shell.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        trace!("kernel: spawn");
+        // `new` already builds the address space, the main thread, its trap
+        // context and registers the process in PID2PCB and in the scheduler
+        let child = Self::new(elf_data);
+        // only link the family afterwards: the parent field is not read by the
+        // child while it runs, so a timer switch in between is harmless
+        self.inner_exclusive_access().children.push(Arc::clone(&child));
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        child
     }
 }

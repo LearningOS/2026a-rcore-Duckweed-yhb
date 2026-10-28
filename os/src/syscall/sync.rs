@@ -35,25 +35,28 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
             .tid
     );
     let process = current_process();
-    let mutex: Option<Arc<dyn Mutex>> = if !blocking {
-        Some(Arc::new(MutexSpin::new()))
-    } else {
-        Some(Arc::new(MutexBlocking::new()))
-    };
     let mut process_inner = process.inner_exclusive_access();
-    if let Some(id) = process_inner
+    // reserve the id first: a blocking mutex needs to know it for the deadlock
+    // detector's resource-allocation graph
+    let id = if let Some(id) = process_inner
         .mutex_list
         .iter()
         .enumerate()
         .find(|(_, item)| item.is_none())
         .map(|(id, _)| id)
     {
-        process_inner.mutex_list[id] = mutex;
-        id as isize
+        id
     } else {
-        process_inner.mutex_list.push(mutex);
-        process_inner.mutex_list.len() as isize - 1
-    }
+        process_inner.mutex_list.push(None);
+        process_inner.mutex_list.len() - 1
+    };
+    let mutex: Arc<dyn Mutex> = if !blocking {
+        Arc::new(MutexSpin::new())
+    } else {
+        Arc::new(MutexBlocking::new(id))
+    };
+    process_inner.mutex_list[id] = Some(mutex);
+    id as isize
 }
 /// mutex lock syscall
 pub fn sys_mutex_lock(mutex_id: usize) -> isize {
@@ -73,8 +76,9 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
     drop(process);
-    mutex.lock();
-    0
+    // `lock` reports -0xdead when the detector proves the request can never be
+    // satisfied; the caller gets that error instead of sleeping forever
+    mutex.lock()
 }
 /// mutex unlock syscall
 pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
@@ -112,6 +116,8 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
     );
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
+    // reserve the id first: the semaphore needs to know it for the deadlock
+    // detector's resource-allocation graph
     let id = if let Some(id) = process_inner
         .semaphore_list
         .iter()
@@ -119,14 +125,12 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
         .find(|(_, item)| item.is_none())
         .map(|(id, _)| id)
     {
-        process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
         id
     } else {
-        process_inner
-            .semaphore_list
-            .push(Some(Arc::new(Semaphore::new(res_count))));
+        process_inner.semaphore_list.push(None);
         process_inner.semaphore_list.len() - 1
     };
+    process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count, id)));
     id as isize
 }
 /// semaphore up syscall
@@ -166,8 +170,9 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     let process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
-    sem.down();
-    0
+    // `down` reports -0xdead when the detector proves the request can never be
+    // satisfied; the caller gets that error instead of sleeping forever
+    sem.down()
 }
 /// condvar create syscall
 pub fn sys_condvar_create() -> isize {
@@ -244,8 +249,29 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 }
 /// enable deadlock detection syscall
 ///
-/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+/// Only the calling process enables detection; the switch is part of the PCB so
+/// that processes which never ask for it are not affected at all. The actual
+/// cycle test happens in [`crate::sync::DeadlockGraph`] whenever a thread is
+/// about to block on a mutex or a semaphore.
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] tid[{}] sys_enable_deadlock_detect",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        current_task()
+            .unwrap()
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .tid
+    );
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    // only 0 and 1 are meaningful, anything else is an invalid argument
+    match enabled {
+        0 => process_inner.deadlock.enabled = false,
+        1 => process_inner.deadlock.enabled = true,
+        _ => return -1,
+    }
+    0
 }

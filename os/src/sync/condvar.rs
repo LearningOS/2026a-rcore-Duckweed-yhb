@@ -43,6 +43,9 @@ impl Condvar {
         inner.wait_queue.push_back(current_task().unwrap());
         drop(inner);
         block_current_and_run_next();
-        mutex.lock();
+        // re-acquire the mutex on behalf of the woken thread; a deadlock can not
+        // be reported here because the thread has no way of telling apart "the
+        // condition was signalled" from "the lock request would deadlock"
+        let _ = mutex.lock();
     }
 }
