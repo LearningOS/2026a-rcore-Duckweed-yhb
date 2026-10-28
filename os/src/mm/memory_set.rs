@@ -67,7 +67,7 @@ impl MemorySet {
         );
     }
     /// remove a area
-    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
+    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) -> bool {
         if let Some((idx, area)) = self
             .areas
             .iter_mut()
@@ -76,6 +76,31 @@ impl MemorySet {
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+    /// Whether the virtual page range `[start_vpn, end_vpn)` does not overlap
+    /// with any of the existing areas
+    pub fn is_vpn_range_free(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        !self.areas.iter().any(|area| {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            start_vpn < area_end && area_start < end_vpn
+        })
+    }
+    /// Remove the area exactly covering `[start_vpn, end_vpn)`,
+    /// return whether such an area was found and removed
+    pub fn remove_area(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if let Some((idx, area)) = self.areas.iter_mut().enumerate().find(|(_, area)| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        }) {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            true
+        } else {
+            false
         }
     }
     /// Add a new MapArea into this MemorySet.

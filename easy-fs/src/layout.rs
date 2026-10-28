@@ -86,6 +86,8 @@ pub struct DiskInode {
     pub indirect1: u32,
     pub indirect2: u32,
     type_: DiskInodeType,
+    /// Number of directory entries (hard links) pointing to this inode
+    pub nlink: u32,
 }
 
 impl DiskInode {
@@ -97,6 +99,8 @@ impl DiskInode {
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+        // a newly created inode is referenced by exactly one directory entry
+        self.nlink = 1;
     }
     /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {

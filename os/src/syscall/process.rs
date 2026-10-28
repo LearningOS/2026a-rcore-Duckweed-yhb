@@ -3,12 +3,17 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer, translated_refmut, translated_str, MapPermission, VirtAddr,
+        VirtPageNum,
+    },
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -102,33 +107,83 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Get the current time with second and microsecond into the user struct `ts`
+///
+/// The struct may be split by two pages, so it is written byte by byte
+/// through the page table instead of through a raw pointer.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let time_us = get_time_us();
+    let time_val = TimeVal {
+        sec: time_us / 1_000_000,
+        usec: time_us % 1_000_000,
+    };
+    // copy the bytes of `time_val` into user space
+    let size = core::mem::size_of::<TimeVal>();
+    let src = unsafe {
+        core::slice::from_raw_parts(&time_val as *const TimeVal as *const u8, size)
+    };
+    let mut copied = 0usize;
+    for slice in translated_byte_buffer(token, ts as *const u8, size).iter_mut() {
+        let len = slice.len();
+        slice.copy_from_slice(&src[copied..copied + len]);
+        copied += len;
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Map the virtual page range `[start, start + len)` with the permissions in `port`
+///
+/// `port` is a bit set: bit 0 means readable, bit 1 writable and bit 2 executable.
+/// Return -1 if the arguments are invalid or the range is mapped before.
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    // the start address must be page aligned, and only R/W/X bits are allowed
+    if start % PAGE_SIZE != 0 || len == 0 || port == 0 || port & !0x7 != 0 {
+        return -1;
+    }
+    let start_vpn: VirtPageNum = VirtAddr::from(start).into();
+    let end_vpn: VirtPageNum = VirtAddr::from(start + len).ceil();
+    if end_vpn <= start_vpn || !inner.memory_set.is_vpn_range_free(start_vpn, end_vpn) {
+        return -1;
+    }
+    let mut map_perm = MapPermission::U;
+    if port & 0x1 != 0 {
+        map_perm |= MapPermission::R;
+    }
+    if port & 0x2 != 0 {
+        map_perm |= MapPermission::W;
+    }
+    if port & 0x4 != 0 {
+        map_perm |= MapPermission::X;
+    }
+    inner
+        .memory_set
+        .insert_framed_area(start.into(), (start + len).into(), map_perm);
+    0
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Unmap the virtual page range `[start, start + len)`
+///
+/// The whole range must be page aligned and exactly equal to an area mapped
+/// before, otherwise -1 is returned.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let start_vpn: VirtPageNum = VirtAddr::from(start).into();
+    let end_vpn: VirtPageNum = VirtAddr::from(start + len).into();
+    if inner.memory_set.remove_area(start_vpn, end_vpn) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,14 +196,22 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Create a new process by loading the elf file `path`, and return its pid
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let task = current_task().unwrap();
+        let new_task = task.spawn(all_data.as_slice());
+        let new_pid = new_task.pid.0;
+        // add new task to scheduler
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
