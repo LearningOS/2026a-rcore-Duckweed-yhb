@@ -9,7 +9,7 @@ pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// A stride scheduler: the ready process with the smallest `stride` runs next.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -21,9 +21,28 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the ready process with the smallest stride out of the ready queue.
+    ///
+    /// The chosen process has its `stride` increased by its `pass` before it
+    /// is returned, so that a process with a higher priority (a smaller pass)
+    /// is picked again sooner.
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let mut min_index: Option<usize> = None;
+        let mut min_stride = usize::MAX;
+        for (index, task) in self.ready_queue.iter().enumerate() {
+            let stride = task.inner_exclusive_access().stride;
+            if stride < min_stride {
+                min_stride = stride;
+                min_index = Some(index);
+            }
+        }
+        let index = min_index?;
+        let task = self.ready_queue.remove(index).unwrap();
+        {
+            let mut inner = task.inner_exclusive_access();
+            inner.stride += inner.pass;
+        }
+        Some(task)
     }
 }
 

@@ -300,6 +300,61 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map `len` bytes starting at the user virtual address `start`.
+    ///
+    /// `port` uses the user visible permission numbering: bit 0 is read, bit 1
+    /// is write and bit 2 is execute. The request is refused (`false`) when
+    /// `start` is not page aligned, when `port` contains unknown bits or no
+    /// bit at all, or when the requested page range overlaps an existing area.
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> bool {
+        /// only read, write and execute are meaningful
+        const PORT_MASK: usize = 0b111;
+        if start % PAGE_SIZE != 0 || port == 0 || port & !PORT_MASK != 0 {
+            return false;
+        }
+        let start_vpn: VirtPageNum = VirtAddr::from(start).floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start.wrapping_add(len)).ceil();
+        if end_vpn <= start_vpn {
+            return false;
+        }
+        for area in self.areas.iter() {
+            let overlap =
+                area.vpn_range.get_start() < end_vpn && start_vpn < area.vpn_range.get_end();
+            if overlap {
+                return false;
+            }
+        }
+        // MapPermission stores R/W/X one bit higher than the user visible flags.
+        let permission = MapPermission::from_bits_truncate((port << 1) as u8) | MapPermission::U;
+        self.push(
+            MapArea::new(start.into(), end_vpn.into(), MapType::Framed, permission),
+            None,
+        );
+        true
+    }
+
+    /// Unmap the area that is exactly `[start, start + len)`.
+    ///
+    /// A request that is not page aligned or that only partially overlaps an
+    /// area is refused (`false`), which is what `ch4_unmap2` expects.
+    pub fn munmap(&mut self, start: usize, len: usize) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let start_vpn: VirtPageNum = VirtAddr::from(start).floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start.wrapping_add(len)).ceil();
+        let found = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        });
+        if let Some(index) = found {
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

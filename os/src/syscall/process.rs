@@ -2,6 +2,7 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::CLOCK_FREQ,
     loader::get_app_data_by_name,
     mm::{translated_refmut, translated_str},
     task::{
@@ -105,30 +106,48 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let ticks = crate::timer::get_time();
+    let sec = ticks / CLOCK_FREQ;
+    let usec = (ticks % CLOCK_FREQ) * 1_000_000 / CLOCK_FREQ;
+    // Write the two fields through the user page table one at a time, so a
+    // `TimeVal` that straddles a page boundary is handled correctly.
+    let ts = ts as usize;
+    *translated_refmut(token, ts as *mut usize) = sec;
+    *translated_refmut(token, (ts + core::mem::size_of::<usize>()) as *mut usize) = usec;
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.mmap(start, len, port) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_munmap",
         current_task().unwrap().pid.0
     );
-    -1
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.munmap(start, len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -143,19 +162,36 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let task = current_task().unwrap();
+        let new_task = task.spawn(data);
+        let new_pid = new_task.pid.0;
+        // The new process runs from the ELF entry point, so its trap context is
+        // already initialized by `spawn`; just make it schedulable.
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// YOUR JOB: Set task priority.
+///
+/// The valid range is `[2, isize::MAX]`; on success the new priority is
+/// returned, otherwise `-1` is returned and nothing changes.
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_set_priority [{}]",
+        current_task().unwrap().pid.0,
+        prio
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.set_priority(prio as usize) as isize
 }
