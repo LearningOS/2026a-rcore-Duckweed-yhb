@@ -14,6 +14,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
@@ -133,6 +134,41 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Map memory for the current task, as asked by `sys_mmap`.
+    fn current_mmap(&self, start: usize, len: usize, port: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.mmap(start, len, port)
+    }
+
+    /// Unmap memory of the current task, as asked by `sys_munmap`.
+    fn current_munmap(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.munmap(start, len)
+    }
+
+    /// Record one more call of `syscall_id` for the current task. Called before
+    /// the syscall is dispatched, so that querying `TRACE` also counts itself.
+    fn inc_syscall_times(&self, syscall_id: usize) {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+
+    /// How many times the current task has called `syscall_id` so far.
+    fn get_syscall_times(&self, syscall_id: usize) -> usize {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return 0;
+        }
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id]
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +237,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Map memory for the current task, as asked by `sys_mmap`.
+pub fn current_mmap(start: usize, len: usize, port: usize) -> bool {
+    TASK_MANAGER.current_mmap(start, len, port)
+}
+
+/// Unmap memory of the current task, as asked by `sys_munmap`.
+pub fn current_munmap(start: usize, len: usize) -> bool {
+    TASK_MANAGER.current_munmap(start, len)
+}
+
+/// Record one more call of `syscall_id` for the current task.
+pub fn inc_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.inc_syscall_times(syscall_id);
+}
+
+/// How many times the current task has called `syscall_id` so far.
+pub fn get_syscall_times(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_syscall_times(syscall_id)
 }

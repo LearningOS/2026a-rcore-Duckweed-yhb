@@ -262,6 +262,59 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map `len` bytes at the user virtual address `start_va`, as `sys_mmap` asks.
+    ///
+    /// `port` uses the flag numbering of the user library: bit 0 is read, bit 1
+    /// is write and bit 2 is execute. The request is refused when the start
+    /// address is not page aligned, when no known flag is set, or when the
+    /// range overlaps an area that is already mapped.
+    pub fn mmap(&mut self, start_va: usize, len: usize, port: usize) -> bool {
+        /// read, write and execute are the only meaningful bits
+        const PORT_MASK: usize = 0b111;
+        if start_va % PAGE_SIZE != 0 || port == 0 || port & !PORT_MASK != 0 {
+            return false;
+        }
+        let start_vpn: VirtPageNum = VirtAddr::from(start_va).floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start_va.wrapping_add(len)).ceil();
+        if end_vpn <= start_vpn {
+            return false;
+        }
+        for area in &self.areas {
+            let overlap =
+                area.vpn_range.get_start() < end_vpn && start_vpn < area.vpn_range.get_end();
+            if overlap {
+                return false;
+            }
+        }
+        // MapPermission stores R/W/X one bit higher than the user visible flags
+        let permission = MapPermission::from_bits_truncate((port << 1) as u8) | MapPermission::U;
+        let end_va: VirtAddr = end_vpn.into();
+        self.insert_framed_area(start_va.into(), end_va, permission);
+        true
+    }
+
+    /// Unmap the area that is exactly `[start_va, start_va + len)`.
+    ///
+    /// A partially matching request is refused, which is what the `munmap`
+    /// test cases expect.
+    pub fn munmap(&mut self, start_va: usize, len: usize) -> bool {
+        if start_va % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let start_vpn: VirtPageNum = VirtAddr::from(start_va).floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start_va.wrapping_add(len)).ceil();
+        let found = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        });
+        if let Some(index) = found {
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
